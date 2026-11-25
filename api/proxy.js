@@ -39,8 +39,12 @@ function connectUpstream(port) {
           port: 80
         });
 
+    const connectEvent = port === "443"
+      ? "secureConnect"
+      : "connect";
+
     const onError = (error) => {
-      socket.removeListener("connect", onConnect);
+      socket.removeListener(connectEvent, onConnect);
       rejectPromise(error);
     };
 
@@ -50,7 +54,7 @@ function connectUpstream(port) {
     };
 
     socket.once("error", onError);
-    socket.once(port === "443" ? "secureConnect" : "connect", onConnect);
+    socket.once(connectEvent, onConnect);
   });
 }
 
@@ -68,7 +72,9 @@ function createHeadStripper() {
       pending.subarray(0, 5).toString("latin1") === "HTTP/"
     ) {
       const end = pending.indexOf("\r\n\r\n");
+
       if (end === -1) return null;
+
       pending = pending.subarray(end + 4);
     }
 
@@ -76,8 +82,10 @@ function createHeadStripper() {
     if (pending.length < 5) return null;
 
     done = true;
+
     const result = pending;
     pending = Buffer.alloc(0);
+
     return result;
   };
 }
@@ -101,9 +109,14 @@ function makeUpstreamRequest(req, path) {
       lower === "upgrade" ||
       lower.startsWith("sec-websocket-") ||
       lower === "content-length"
-    ) continue;
+    ) {
+      continue;
+    }
 
-    if (typeof value === "string" && !/[\r\n]/.test(value)) {
+    if (
+      typeof value === "string" &&
+      !/[\r\n]/.test(value)
+    ) {
       headers.push(`${name}: ${value}`);
     }
   }
@@ -111,52 +124,53 @@ function makeUpstreamRequest(req, path) {
   return headers.join("\r\n") + "\r\n\r\n";
 }
 
+// RAW tunnel corrigido
 function startRawTunnel(client, head, upstream, request, debug) {
   let closed = false;
-  let ready = false;
-  const queue = [];
   const strip = createHeadStripper();
 
   const closeBoth = () => {
     if (closed) return;
     closed = true;
-    client.destroy();
+
+    if (!client.destroyed) client.destroy();
     if (!upstream.destroyed) upstream.destroy();
   };
 
-  upstream.write(request);
-
-  if (head?.length) upstream.write(head);
-
   upstream.on("data", (data) => {
     const output = debug ? data : strip(data);
+
     if (output?.length && client.writable) {
       client.write(output);
     }
   });
 
   client.on("data", (data) => {
-    if (upstream.destroyed) return;
-    if (ready) upstream.write(data);
-    else queue.push(data);
+    if (!upstream.destroyed && upstream.writable) {
+      upstream.write(data);
+    }
   });
 
-  upstream.on("connect", () => {
-    ready = true;
-    for (const chunk of queue) upstream.write(chunk);
-    queue.length = 0;
+  upstream.on("error", (error) => {
+    console.error("[DROPNET] upstream error:", error.message);
+    closeBoth();
   });
 
-  upstream.on("secureConnect", () => {
-    ready = true;
-    for (const chunk of queue) upstream.write(chunk);
-    queue.length = 0;
-  });
-
-  upstream.on("error", closeBoth);
   upstream.on("close", closeBoth);
   client.on("close", closeBoth);
   client.on("error", closeBoth);
+
+  // A conexão já foi estabelecida em connectUpstream().
+  if (upstream.destroyed || !upstream.writable) {
+    closeBoth();
+    return;
+  }
+
+  upstream.write(request);
+
+  if (head?.length) {
+    upstream.write(head);
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -194,6 +208,7 @@ const wss = new WebSocketServer({
 
 server.on("upgrade", async (req, clientSocket, head) => {
   const incoming = new URL(req.url || "/", "http://localhost");
+
   const port = incoming.searchParams.get("port") || "443";
   const path = incoming.searchParams.get("path") || "/";
   const raw = incoming.searchParams.get("raw") === "1";
@@ -241,7 +256,14 @@ server.on("upgrade", async (req, clientSocket, head) => {
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
 
-    startRawTunnel(clientSocket, head, upstream, request, debug);
+    startRawTunnel(
+      clientSocket,
+      head,
+      upstream,
+      request,
+      debug
+    );
+
     return;
   }
 
@@ -251,8 +273,12 @@ server.on("upgrade", async (req, clientSocket, head) => {
     const closeBoth = () => {
       if (closed) return;
       closed = true;
+
       if (!upstream.destroyed) upstream.destroy();
-      if (client.readyState === WebSocket.OPEN) client.close();
+
+      if (client.readyState === WebSocket.OPEN) {
+        client.close();
+      }
     };
 
     upstream.write(request);
@@ -264,10 +290,16 @@ server.on("upgrade", async (req, clientSocket, head) => {
     });
 
     client.on("message", (data) => {
-      if (!upstream.destroyed) upstream.write(data);
+      if (!upstream.destroyed) {
+        upstream.write(data);
+      }
     });
 
-    upstream.on("error", closeBoth);
+    upstream.on("error", (error) => {
+      console.error("[DROPNET] upstream error:", error.message);
+      closeBoth();
+    });
+
     upstream.on("close", closeBoth);
     client.on("close", closeBoth);
     client.on("error", closeBoth);
