@@ -1,12 +1,14 @@
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
+import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 
 // Servidor para onde a Vercel conecta (DNS)
 const VPS_HOST = "gm.dpnet.online";
-// Nome do certificado HTTPS que o VPS apresenta (SNI + validacao)
+// Nome do certificado HTTPS que o VPS apresenta (usado so na porta 443)
 const TLS_NAME = "cdn.dpnet.online";
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 function reject(socket, status, text) {
   if (socket.writable) {
@@ -15,6 +17,90 @@ function reject(socket, status, text) {
     );
   }
   socket.destroy();
+}
+
+// STRIPPER-START
+// Remove os cabecalhos "HTTP/1.1 101 ..." / "HTTP/1.1 200 ..." que o servico do VPS
+// manda no inicio, deixando passar so os dados reais (ex.: banner do SSH).
+function createHeadStripper() {
+  let pending = Buffer.alloc(0);
+  let done = false;
+  return (data) => {
+    if (done) return data;
+    pending = Buffer.concat([pending, data]);
+    while (pending.length >= 5 && pending.subarray(0, 5).toString("latin1") === "HTTP/") {
+      const end = pending.indexOf("\r\n\r\n");
+      if (end === -1) return null; // cabecalho incompleto, espera mais dados
+      pending = pending.subarray(end + 4);
+    }
+    if (pending.length === 0) return null;
+    if (pending.length < 5) return null; // pode ser o comeco de outro "HTTP/"
+    done = true;
+    const out = pending;
+    pending = Buffer.alloc(0);
+    return out;
+  };
+}
+// STRIPPER-END
+
+function connectUpstream(port, onReady) {
+  return port === "443"
+    ? tls.connect(
+        { host: VPS_HOST, port: 443, servername: TLS_NAME, rejectUnauthorized: true },
+        onReady
+      )
+    : net.connect({ host: VPS_HOST, port: 80 }, onReady);
+}
+
+// Modo "raw" (HTTP Injector / payload): responde 101 e depois so repassa bytes crus
+function startRawTunnel(client, head, port, request) {
+  let upstream;
+  let closed = false;
+  let ready = false;
+  const queue = [];
+  const strip = createHeadStripper();
+
+  const closeBoth = () => {
+    if (closed) return;
+    closed = true;
+    client.destroy();
+    if (upstream && !upstream.destroyed) upstream.destroy();
+  };
+
+  const onReady = () => {
+    ready = true;
+    console.log(`[raw] conectado ao VPS ${VPS_HOST}:${port}`);
+    upstream.write(request);
+    if (head && head.length) upstream.write(head);
+    for (const chunk of queue) upstream.write(chunk);
+    queue.length = 0;
+  };
+
+  upstream = connectUpstream(port, onReady);
+  upstream.setTimeout(300000);
+
+  upstream.on("data", (data) => {
+    const out = strip(data);
+    if (out && out.length && client.writable) client.write(out);
+  });
+
+  client.on("data", (data) => {
+    if (!upstream || upstream.destroyed) return;
+    if (ready) upstream.write(data);
+    else queue.push(data);
+  });
+
+  upstream.on("timeout", () => {
+    console.error("[raw] timeout na conexao com o VPS");
+    closeBoth();
+  });
+  upstream.on("error", (err) => {
+    console.error(`[raw] erro upstream: ${err.code || ""} ${err.message}`);
+    closeBoth();
+  });
+  upstream.on("close", closeBoth);
+  client.on("close", closeBoth);
+  client.on("error", closeBoth);
 }
 
 const server = http.createServer((req, res) => {
@@ -29,7 +115,7 @@ const server = http.createServer((req, res) => {
         host: VPS_HOST,
         tlsName: TLS_NAME,
         ports: [80, 443],
-        mode: "tcp-bridge"
+        modes: ["ws", "raw"]
       })
     );
     return;
@@ -61,9 +147,12 @@ server.on("upgrade", (req, clientSocket, head) => {
     return reject(clientSocket, 400, "Bad Request");
   }
 
-  const key = req.headers["sec-websocket-key"];
+  const raw = incoming.searchParams.get("raw") === "1";
+
+  let key = req.headers["sec-websocket-key"];
   if (!key) {
-    return reject(clientSocket, 400, "Bad Request");
+    if (raw) key = crypto.randomBytes(16).toString("base64");
+    else return reject(clientSocket, 400, "Bad Request");
   }
 
   const headers = [
@@ -94,6 +183,21 @@ server.on("upgrade", (req, clientSocket, head) => {
   }
 
   const request = headers.join("\r\n") + "\r\n\r\n";
+
+  if (raw) {
+    const accept = crypto
+      .createHash("sha1")
+      .update(key + WS_GUID)
+      .digest("base64");
+    clientSocket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    startRawTunnel(clientSocket, head, port, request);
+    return;
+  }
 
   wss.handleUpgrade(req, clientSocket, head, (client) => {
     let upstream;
@@ -126,33 +230,11 @@ server.on("upgrade", (req, clientSocket, head) => {
       queue.length = 0;
     };
 
-    upstream =
-      port === "443"
-        ? tls.connect(
-            {
-              host: VPS_HOST,
-              port: 443,
-              servername: TLS_NAME,
-              rejectUnauthorized: true
-            },
-            onReady
-          )
-        : net.connect({ host: VPS_HOST, port: 80 }, onReady);
-
+    upstream = connectUpstream(port, onReady);
     upstream.setTimeout(300000);
 
-    let loggedFirst = false;
     upstream.on("data", (data) => {
       bytesFromVps += data.length;
-      if (!loggedFirst) {
-        loggedFirst = true;
-        const first = data
-          .subarray(0, 160)
-          .toString("latin1")
-          .replace(/\r/g, "\\r")
-          .replace(/\n/g, "\\n");
-        console.log(`[proxy] primeira resposta do VPS: ${first}`);
-      }
       if (client.readyState === WebSocket.OPEN) {
         client.send(data, { binary: true });
       }
