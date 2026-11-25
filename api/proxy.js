@@ -1,10 +1,8 @@
 import http from "node:http";
 import net from "node:net";
-import tls from "node:tls";
 import { WebSocketServer, WebSocket } from "ws";
 
 const VPS_HOST = "gm.dpnet.online";
-const TLS_NAME = "cdn.dpnet.online";
 
 function reject(socket, status, message) {
   if (!socket.destroyed && socket.writable) {
@@ -17,57 +15,41 @@ function reject(socket, status, message) {
 }
 
 function validPath(path) {
-  return (
-    typeof path === "string" &&
+  return typeof path === "string" &&
     path.startsWith("/") &&
     !path.startsWith("//") &&
-    !/[\r\n]/.test(path)
-  );
+    !/[\r\n]/.test(path);
 }
 
-function connectUpstream(port) {
+function connectUpstream() {
   return new Promise((resolve, rejectPromise) => {
-    const socket = port === "443"
-      ? tls.connect({
-          host: VPS_HOST,
-          port: 443,
-          servername: TLS_NAME,
-          rejectUnauthorized: true
-        })
-      : net.connect({
-          host: VPS_HOST,
-          port: 80
-        });
-
-    const event = port === "443" ? "secureConnect" : "connect";
+    const socket = net.connect({
+      host: VPS_HOST,
+      port: 80
+    });
 
     const timer = setTimeout(() => {
       socket.destroy();
-      rejectPromise(new Error("Tempo esgotado ao conectar à origem"));
+      rejectPromise(new Error("Timeout na origem"));
     }, 10000);
 
-    const onError = (error) => {
+    socket.once("error", error => {
       clearTimeout(timer);
       rejectPromise(error);
-    };
+    });
 
-    socket.once("error", onError);
-
-    socket.once(event, () => {
+    socket.once("connect", () => {
       clearTimeout(timer);
-      socket.removeListener("error", onError);
       resolve(socket);
     });
   });
 }
 
-// A origem responde com cabeçalhos HTTP próprios.
-// Retiramos esses cabeçalhos antes de transportar os dados pelo WebSocket.
 function createResponseStripper() {
   let pending = Buffer.alloc(0);
   let finished = false;
 
-  return (chunk) => {
+  return chunk => {
     if (finished) return chunk;
 
     pending = Buffer.concat([pending, chunk]);
@@ -84,7 +66,7 @@ function createResponseStripper() {
 
       if (end === -1) {
         if (pending.length > 65536) {
-          throw new Error("Cabeçalho da origem excedeu o limite");
+          throw new Error("Cabeçalho muito grande");
         }
         return null;
       }
@@ -96,7 +78,6 @@ function createResponseStripper() {
   };
 }
 
-// Requisição HTTP enviada à origem, não é um segundo handshake WebSocket.
 function makeOriginRequest(path) {
   return [
     `GET ${path} HTTP/1.1`,
@@ -122,9 +103,8 @@ const server = http.createServer((req, res) => {
       service: "DROPNET CDN",
       status: "online",
       host: VPS_HOST,
-      originPort: 80,
-      websocket: true,
-      mode: "tcp-bridge"
+      port: 80,
+      mode: "websocket-tcp"
     }));
   }
 
@@ -134,7 +114,7 @@ const server = http.createServer((req, res) => {
     Upgrade: "websocket"
   });
 
-  res.end("DROPNET CDN - Conexao WebSocket necessaria.");
+  res.end("DROPNET CDN - WebSocket necessario.");
 });
 
 const wss = new WebSocketServer({
@@ -144,112 +124,89 @@ const wss = new WebSocketServer({
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  const incoming = new URL(req.url || "/", "http://localhost");
-
-  // Porta da ORIGEM. A conexão do cliente com a Vercel é HTTPS/WSS.
-  const port = incoming.searchParams.get("port") || "80";
-  const path = incoming.searchParams.get("path") || "/";
-
-  if (port !== "80" && port !== "443") {
-    return reject(socket, 400, "Invalid Origin Port");
-  }
+  const url = new URL(req.url || "/", "http://localhost");
+  const path = url.searchParams.get("path") || "/";
 
   if (!validPath(path)) {
-    return reject(socket, 400, "Invalid Origin Path");
+    return reject(socket, 400, "Invalid Path");
   }
 
-  const key = req.headers["sec-websocket-key"];
-
   if (
-    typeof key !== "string" ||
+    !req.headers["sec-websocket-key"] ||
     !req.headers.upgrade?.toLowerCase().includes("websocket")
   ) {
-    return reject(socket, 400, "Invalid WebSocket Request");
+    return reject(socket, 400, "Invalid WebSocket");
   }
 
   let upstream;
 
   try {
-    upstream = await connectUpstream(port);
+    upstream = await connectUpstream();
   } catch (error) {
-    console.error("[DROPNET] Origin connection:", error.message);
+    console.error("[DROPNET] Origin:", error.message);
     return reject(socket, 502, "Origin Connection Failed");
   }
 
-  wss.handleUpgrade(req, socket, head, (client) => {
+  wss.handleUpgrade(req, socket, head, client => {
     let closed = false;
     const stripHeaders = createResponseStripper();
 
-    const closeBoth = () => {
+    function closeBoth() {
       if (closed) return;
       closed = true;
 
       if (!upstream.destroyed) upstream.destroy();
 
-      if (
-        client.readyState === WebSocket.OPEN ||
-        client.readyState === WebSocket.CONNECTING
-      ) {
+      if (client.readyState === WebSocket.OPEN) {
         client.terminate();
       }
-    };
+    }
 
-    // Dados TCP da origem -> frames WebSocket para o cliente.
-    upstream.on("data", (chunk) => {
+    upstream.on("data", chunk => {
       let output;
 
       try {
         output = stripHeaders(chunk);
       } catch (error) {
-        console.error("[DROPNET] Origin response:", error.message);
+        console.error("[DROPNET] Response:", error.message);
         closeBoth();
         return;
       }
 
       if (
-        output &&
-        output.length > 0 &&
+        output?.length &&
         client.readyState === WebSocket.OPEN
       ) {
-        client.send(output, { binary: true }, (error) => {
+        client.send(output, { binary: true }, error => {
           if (error) closeBoth();
         });
       }
     });
 
-    // Mensagens WebSocket do cliente -> bytes TCP para a origem.
-    client.on("message", (data) => {
+    client.on("message", data => {
       if (upstream.destroyed || !upstream.writable) {
         closeBoth();
         return;
       }
 
-      const payload = Array.isArray(data)
-        ? Buffer.concat(data)
-        : Buffer.from(data);
-
-      upstream.write(payload);
+      upstream.write(Buffer.from(data));
     });
 
-    upstream.on("error", (error) => {
-      console.error("[DROPNET] Origin error:", error.message);
+    upstream.on("error", error => {
+      console.error("[DROPNET] TCP:", error.message);
       closeBoth();
     });
 
     upstream.on("end", () => {
       if (client.readyState === WebSocket.OPEN) {
-        client.close(1000, "Origin ended connection");
+        client.close(1000, "Origin ended");
       }
     });
 
     upstream.on("close", closeBoth);
     client.on("close", closeBoth);
-    client.on("error", (error) => {
-      console.error("[DROPNET] WebSocket error:", error.message);
-      closeBoth();
-    });
+    client.on("error", closeBoth);
 
-    // Inicia a requisição HTTP na origem depois de aceitar o WebSocket.
     upstream.write(makeOriginRequest(path));
   });
 });
