@@ -3,9 +3,11 @@ import net from "node:net";
 import tls from "node:tls";
 import { WebSocketServer, WebSocket } from "ws";
 
+// Servidor para onde a Vercel conecta (DNS)
 const VPS_HOST = "gm.dpnet.online";
+// Nome do certificado HTTPS que o VPS apresenta (SNI + validacao)
+const TLS_NAME = "cdn.dpnet.online";
 
-// Responde um erro HTTP simples antes do upgrade (em vez de derrubar a conexao calado)
 function reject(socket, status, text) {
   if (socket.writable) {
     socket.write(
@@ -25,6 +27,7 @@ const server = http.createServer((req, res) => {
         service: "DROPNET CDN",
         status: "online",
         host: VPS_HOST,
+        tlsName: TLS_NAME,
         ports: [80, 443],
         mode: "tcp-bridge"
       })
@@ -96,6 +99,7 @@ server.on("upgrade", (req, clientSocket, head) => {
     let upstream;
     let closed = false;
     let ready = false;
+    let bytesFromVps = 0;
     const queue = [];
 
     const closeBoth = () => {
@@ -114,10 +118,9 @@ server.on("upgrade", (req, clientSocket, head) => {
       }
     };
 
-    // Chamado UMA vez quando a conexao com o VPS esta pronta
-    // (443: apos o handshake TLS; 80: apos conectar o TCP)
     const onReady = () => {
       ready = true;
+      console.log(`[proxy] conectado ao VPS ${VPS_HOST}:${port}`);
       upstream.write(request);
       for (const chunk of queue) upstream.write(chunk);
       queue.length = 0;
@@ -126,14 +129,30 @@ server.on("upgrade", (req, clientSocket, head) => {
     upstream =
       port === "443"
         ? tls.connect(
-            { host: VPS_HOST, port: 443, servername: VPS_HOST, rejectUnauthorized: true },
+            {
+              host: VPS_HOST,
+              port: 443,
+              servername: TLS_NAME,
+              rejectUnauthorized: true
+            },
             onReady
           )
         : net.connect({ host: VPS_HOST, port: 80 }, onReady);
 
     upstream.setTimeout(300000);
 
+    let loggedFirst = false;
     upstream.on("data", (data) => {
+      bytesFromVps += data.length;
+      if (!loggedFirst) {
+        loggedFirst = true;
+        const first = data
+          .subarray(0, 160)
+          .toString("latin1")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n");
+        console.log(`[proxy] primeira resposta do VPS: ${first}`);
+      }
       if (client.readyState === WebSocket.OPEN) {
         client.send(data, { binary: true });
       }
@@ -145,9 +164,18 @@ server.on("upgrade", (req, clientSocket, head) => {
       else queue.push(data);
     });
 
-    upstream.on("timeout", closeBoth);
-    upstream.on("error", closeBoth);
-    upstream.on("close", closeBoth);
+    upstream.on("timeout", () => {
+      console.error("[proxy] timeout na conexao com o VPS");
+      closeBoth();
+    });
+    upstream.on("error", (err) => {
+      console.error(`[proxy] erro upstream: ${err.code || ""} ${err.message}`);
+      closeBoth();
+    });
+    upstream.on("close", () => {
+      console.log(`[proxy] upstream fechou (bytes recebidos: ${bytesFromVps})`);
+      closeBoth();
+    });
     client.on("close", closeBoth);
     client.on("error", closeBoth);
   });
