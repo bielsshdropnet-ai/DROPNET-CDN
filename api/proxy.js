@@ -5,26 +5,38 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const VPS_HOST = "cdn.dpnet.online";
 
+// Responde um erro HTTP simples antes do upgrade (em vez de derrubar a conexao calado)
+function reject(socket, status, text) {
+  if (socket.writable) {
+    socket.write(
+      `HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`
+    );
+  }
+  socket.destroy();
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
-  if (url.pathname === "/api/proxy" && url.searchParams.get("health") === "1") {
+  if (url.searchParams.get("health") === "1") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      service: "DROPNET CDN",
-      status: "online",
-      host: VPS_HOST,
-      ports: [80, 443],
-      mode: "tcp-bridge"
-    }));
+    res.end(
+      JSON.stringify({
+        service: "DROPNET CDN",
+        status: "online",
+        host: VPS_HOST,
+        ports: [80, 443],
+        mode: "tcp-bridge"
+      })
+    );
     return;
   }
 
   res.writeHead(426, {
-    "Content-Type": "text/plain",
-    "Upgrade": "websocket"
+    "Content-Type": "text/plain; charset=utf-8",
+    Upgrade: "websocket"
   });
-  res.end("DROPNET CDN - WebSocket necessário.");
+  res.end("DROPNET CDN - WebSocket necessario.");
 });
 
 const wss = new WebSocketServer({
@@ -36,30 +48,19 @@ const wss = new WebSocketServer({
 server.on("upgrade", (req, clientSocket, head) => {
   const incoming = new URL(req.url || "/", "http://localhost");
 
-  if (incoming.pathname !== "/api/proxy") {
-    clientSocket.destroy();
-    return;
-  }
-
   const port = incoming.searchParams.get("port") || "443";
-
   if (port !== "80" && port !== "443") {
-    clientSocket.destroy();
-    return;
+    return reject(clientSocket, 400, "Bad Request");
   }
 
   const path = incoming.searchParams.get("path") || "/";
-
   if (!path.startsWith("/") || path.startsWith("//") || /[\r\n]/.test(path)) {
-    clientSocket.destroy();
-    return;
+    return reject(clientSocket, 400, "Bad Request");
   }
 
   const key = req.headers["sec-websocket-key"];
-
   if (!key) {
-    clientSocket.destroy();
-    return;
+    return reject(clientSocket, 400, "Bad Request");
   }
 
   const headers = [
@@ -80,7 +81,9 @@ server.on("upgrade", (req, clientSocket, head) => {
       lower === "upgrade" ||
       lower.startsWith("sec-websocket-") ||
       lower === "content-length"
-    ) continue;
+    ) {
+      continue;
+    }
 
     if (typeof value === "string" && !/[\r\n]/.test(value)) {
       headers.push(`${name}: ${value}`);
@@ -92,6 +95,8 @@ server.on("upgrade", (req, clientSocket, head) => {
   wss.handleUpgrade(req, clientSocket, head, (client) => {
     let upstream;
     let closed = false;
+    let ready = false;
+    const queue = [];
 
     const closeBoth = () => {
       if (closed) return;
@@ -101,33 +106,32 @@ server.on("upgrade", (req, clientSocket, head) => {
         upstream.destroy();
       }
 
-      if (client.readyState === WebSocket.OPEN) {
+      if (
+        client.readyState === WebSocket.OPEN ||
+        client.readyState === WebSocket.CONNECTING
+      ) {
         client.close();
       }
     };
 
-    const options = {
-      host: VPS_HOST,
-      port: Number(port)
+    // Chamado UMA vez quando a conexao com o VPS esta pronta
+    // (443: apos o handshake TLS; 80: apos conectar o TCP)
+    const onReady = () => {
+      ready = true;
+      upstream.write(request);
+      for (const chunk of queue) upstream.write(chunk);
+      queue.length = 0;
     };
 
-    upstream = port === "443"
-      ? tls.connect({
-          ...options,
-          servername: VPS_HOST,
-          rejectUnauthorized: true
-        })
-      : net.connect(options);
+    upstream =
+      port === "443"
+        ? tls.connect(
+            { host: VPS_HOST, port: 443, servername: VPS_HOST, rejectUnauthorized: true },
+            onReady
+          )
+        : net.connect({ host: VPS_HOST, port: 80 }, onReady);
 
     upstream.setTimeout(300000);
-
-    upstream.on("connect", () => {
-      upstream.write(request);
-    });
-
-    upstream.on("secureConnect", () => {
-      upstream.write(request);
-    });
 
     upstream.on("data", (data) => {
       if (client.readyState === WebSocket.OPEN) {
@@ -136,9 +140,9 @@ server.on("upgrade", (req, clientSocket, head) => {
     });
 
     client.on("message", (data) => {
-      if (upstream && !upstream.destroyed) {
-        upstream.write(data);
-      }
+      if (!upstream || upstream.destroyed) return;
+      if (ready) upstream.write(data);
+      else queue.push(data);
     });
 
     upstream.on("timeout", closeBoth);
