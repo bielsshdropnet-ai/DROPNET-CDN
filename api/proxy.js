@@ -8,7 +8,7 @@ import WebSocket, { WebSocketServer } from "ws";
 
 // Coloque somente o domínio ou IP da VPS.
 // Não coloque http://, https:// ou a porta.
-const VPS_HOST = "191.96.225.248";
+const VPS_HOST = "cdn.dpnet.online";
 
 // Destinos disponíveis na VPS.
 const DESTINOS = {
