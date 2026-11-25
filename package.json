@@ -1,6 +1,13 @@
+
 {
   "name": "dropnet-cdn",
   "version": "2.1.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
