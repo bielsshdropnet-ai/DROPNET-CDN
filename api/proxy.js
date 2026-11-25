@@ -3,7 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { WebSocketServer, WebSocket } from "ws";
 
-const VPS_HOST = "cdn.dpnet.online";
+const VPS_HOST = "gm.dpnet.online";
 
 // Responde um erro HTTP simples antes do upgrade (em vez de derrubar a conexao calado)
 function reject(socket, status, text) {
