@@ -1,12 +1,8 @@
 {
-  "name": "dropnet-cdn",
-  "version": "2.0.1",
-  "private": true,
-  "type": "module",
-  "engines": {
-    "node": "22.x"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
+  "service": "DROPNET CDN",
+  "status": "online",
+  "host": "gm.dpnet.online",
+  "originPort": 80,
+  "websocket": true,
+  "mode": "tcp-bridge"
 }
