@@ -1,93 +1,15 @@
 import http from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// ======================================
-// DROPNET CDN - WEBSOCKET REVERSE PROXY
-// Vercel Functions + Node.js + ws
-// ======================================
-
-// Coloque somente o domínio ou IP da VPS.
-// Não coloque http://, https:// ou a porta.
 const VPS_HOST = "cdn.dpnet.online";
 
-// Destinos disponíveis na VPS.
 const DESTINOS = {
   "80": `ws://${VPS_HOST}:80`,
-  "443": `wss://${VPS_HOST}:443`,
+  "443": `wss://${VPS_HOST}:443`
 };
 
-const HANDSHAKE_TIMEOUT = 12000;
+const HANDSHAKE_TIMEOUT = 15000;
 
-function responderErro(socket, status, mensagem) {
-  if (socket.destroyed) return;
-
-  const body = mensagem;
-  socket.end(
-    `HTTP/1.1 ${status}\r\n` +
-    "Connection: close\r\n" +
-    "Content-Type: text/plain; charset=utf-8\r\n" +
-    `Content-Length: ${Buffer.byteLength(body)}\r\n` +
-    "\r\n" +
-    body
-  );
-}
-
-function codigoFechamentoValido(code) {
-  return (
-    code === 1000 ||
-    code === 1001 ||
-    code === 1002 ||
-    code === 1003 ||
-    (code >= 1007 && code <= 1014) ||
-    (code >= 3000 && code <= 4999)
-  ) ? code : 1000;
-}
-
-function encaminhar(client, upstream) {
-  client.on("message", (data, isBinary) => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.send(data, { binary: isBinary }, (error) => {
-        if (error && client.readyState === WebSocket.OPEN) {
-          client.close(1011, "Erro ao encaminhar dados");
-        }
-      });
-    }
-  });
-
-  upstream.on("message", (data, isBinary) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data, { binary: isBinary }, (error) => {
-        if (error && upstream.readyState === WebSocket.OPEN) {
-          upstream.close(1011, "Erro ao encaminhar dados");
-        }
-      });
-    }
-  });
-
-  client.on("close", (code, reason) => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.close(codigoFechamentoValido(code), reason.toString());
-    } else if (upstream.readyState === WebSocket.CONNECTING) {
-      upstream.terminate();
-    }
-  });
-
-  upstream.on("close", (code, reason) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.close(codigoFechamentoValido(code), reason.toString());
-    }
-  });
-
-  client.on("error", () => upstream.terminate());
-
-  upstream.on("error", () => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.close(1011, "Erro na VPS");
-    }
-  });
-}
-
-// Servidor HTTP da Function.
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
@@ -99,7 +21,6 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       service: "DROPNET CDN",
       status: "online",
-      websocket: true,
       ports: [80, 443]
     }));
 
@@ -107,28 +28,64 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(426, {
-    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Type": "text/plain",
     "Upgrade": "websocket"
   });
 
-  res.end("DROPNET CDN: conecte usando WebSocket.");
+  res.end("DROPNET CDN - WebSocket necessário.");
 });
 
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
-  maxPayload: 64 * 1024 * 1024,
-
-  handleProtocols(protocols, request) {
-    const selected = request.__dropnetProtocol;
-
-    return selected && protocols.has(selected)
-      ? selected
-      : false;
-  }
+  maxPayload: 64 * 1024 * 1024
 });
 
-// Recebe o Upgrade WebSocket.
+function responderErro(socket, status, mensagem) {
+  if (socket.destroyed) return;
+
+  const body = mensagem;
+
+  socket.end(
+    `HTTP/1.1 ${status}\r\n` +
+    "Connection: close\r\n" +
+    "Content-Type: text/plain; charset=utf-8\r\n" +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n` +
+    body
+  );
+}
+
+function encaminhar(cliente, upstream) {
+  cliente.on("message", (data, binary) => {
+    if (upstream.readyState === WebSocket.OPEN) {
+      upstream.send(data, { binary });
+    }
+  });
+
+  upstream.on("message", (data, binary) => {
+    if (cliente.readyState === WebSocket.OPEN) {
+      cliente.send(data, { binary });
+    }
+  });
+
+  cliente.on("close", () => {
+    if (upstream.readyState === WebSocket.OPEN) {
+      upstream.close();
+    } else {
+      upstream.terminate();
+    }
+  });
+
+  upstream.on("close", () => {
+    if (cliente.readyState === WebSocket.OPEN) {
+      cliente.close();
+    }
+  });
+
+  cliente.on("error", () => upstream.terminate());
+  upstream.on("error", () => cliente.terminate());
+}
+
 server.on("upgrade", (req, socket, head) => {
   const incoming = new URL(
     req.url || "/",
@@ -140,26 +97,17 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  // Seleciona a porta de destino.
   const port = incoming.searchParams.get("port") || "443";
   const base = DESTINOS[port];
 
-  if (!base || VPS_HOST === "SEU-DOMINIO-VPS") {
-    responderErro(
-      socket,
-      "500 Internal Server Error",
-      "Configure o domínio da VPS em VPS_HOST."
-    );
+  if (!base) {
+    responderErro(socket, "400 Bad Request", "Porta inválida. Use 80 ou 443.");
     return;
   }
 
-  // Caminho que será enviado à VPS.
-  const targetPath = incoming.searchParams.get("path") || "/";
+  const path = incoming.searchParams.get("path") || "/";
 
-  if (
-    !targetPath.startsWith("/") ||
-    targetPath.startsWith("//")
-  ) {
+  if (!path.startsWith("/") || path.startsWith("//")) {
     responderErro(socket, "400 Bad Request", "Caminho inválido.");
     return;
   }
@@ -167,7 +115,7 @@ server.on("upgrade", (req, socket, head) => {
   let target;
 
   try {
-    target = new URL(targetPath, base);
+    target = new URL(path, base);
 
     const expected = new URL(base);
 
@@ -176,7 +124,6 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
 
-    // Encaminha os parâmetros adicionais.
     for (const [key, value] of incoming.searchParams) {
       if (key !== "port" && key !== "path") {
         target.searchParams.append(key, value);
@@ -187,15 +134,6 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  // Protocolos WebSocket solicitados pelo cliente.
-  const protocols = String(
-    req.headers["sec-websocket-protocol"] || ""
-  )
-    .split(",")
-    .map(value => value.trim())
-    .filter(Boolean);
-
-  // Preserva cabeçalhos úteis, removendo os do handshake original.
   const headers = {};
 
   for (const [name, value] of Object.entries(req.headers)) {
@@ -207,92 +145,64 @@ server.on("upgrade", (req, socket, head) => {
       key === "upgrade" ||
       key.startsWith("sec-websocket-") ||
       key === "content-length"
-    ) {
-      continue;
-    }
+    ) continue;
 
     headers[name] = value;
   }
 
-  // Abre primeiro a conexão com a VPS.
-  const upstream = new WebSocket(
-    target.toString(),
-    protocols,
-    {
-      headers,
-      handshakeTimeout: HANDSHAKE_TIMEOUT,
-      perMessageDeflate: false,
-      rejectUnauthorized: true
-    }
-  );
+  const upstream = new WebSocket(target.toString(), {
+    headers,
+    handshakeTimeout: HANDSHAKE_TIMEOUT,
+    perMessageDeflate: false,
+    rejectUnauthorized: true
+  });
 
-  let accepted = false;
   let finished = false;
 
   function falhar(mensagem) {
     if (finished) return;
-
     finished = true;
+
     upstream.terminate();
 
-    responderErro(
-      socket,
-      "502 Bad Gateway",
-      mensagem
-    );
+    responderErro(socket, "502 Bad Gateway", mensagem);
   }
+
+  socket.on("close", () => {
+    if (!finished) upstream.terminate();
+  });
 
   socket.on("error", () => upstream.terminate());
 
-  socket.on("close", () => {
-    if (!accepted) upstream.terminate();
-  });
-
   upstream.on("unexpected-response", (request, response) => {
     const status = response.statusCode || "desconhecido";
-    response.resume();
 
-    falhar(`A VPS não aceitou o WebSocket. HTTP ${status}.`);
+    falhar(
+      `A VPS rejeitou o handshake. HTTP ${status}. Verifique o caminho e o serviço WebSocket.`
+    );
+
+    response.resume();
   });
 
   upstream.on("error", (error) => {
-    if (!accepted) {
-      falhar(`Falha na conexão com a VPS: ${error.message}`);
-    }
+    falhar(`Falha na conexão com a VPS: ${error.message}`);
   });
 
-  upstream.on("close", () => {
-    if (!accepted && !finished) {
-      falhar("A VPS fechou a conexão antes do handshake.");
-    }
-  });
-
-  // Só aceita o cliente depois que a VPS responder ao handshake.
-  upstream.once("open", () => {
-    if (socket.destroyed || finished) {
+  upstream.on("open", () => {
+    if (finished || socket.destroyed) {
       upstream.terminate();
       return;
     }
 
-    req.__dropnetProtocol = upstream.protocol || "";
-
     try {
-      wss.handleUpgrade(req, socket, head, (client) => {
-        accepted = true;
+      wss.handleUpgrade(req, socket, head, (cliente) => {
         finished = true;
-
-        encaminhar(client, upstream);
+        encaminhar(cliente, upstream);
       });
-    } catch {
-      upstream.terminate();
-      responderErro(
-        socket,
-        "502 Bad Gateway",
-        "Falha ao concluir o handshake WebSocket."
-      );
+    } catch (error) {
+      falhar("Falha ao aceitar conexão do cliente.");
     }
   });
 });
 
-// A Vercel gerencia o servidor; não chame server.listen().
 export default server;
