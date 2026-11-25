@@ -53,7 +53,7 @@ function connectUpstream(port, onReady) {
 }
 
 // Modo "raw" (HTTP Injector / payload): responde 101 e depois so repassa bytes crus
-function startRawTunnel(client, head, port, request) {
+function startRawTunnel(client, head, port, request, debug) {
   let upstream;
   let closed = false;
   let ready = false;
@@ -79,18 +79,43 @@ function startRawTunnel(client, head, port, request) {
   upstream = connectUpstream(port, onReady);
   upstream.setTimeout(300000);
 
+  let fromVps = 0;
+  let toClient = 0;
+  let fromClient = 0;
+  let loggedFirst = false;
+
   upstream.on("data", (data) => {
-    const out = strip(data);
-    if (out && out.length && client.writable) client.write(out);
+    fromVps += data.length;
+    if (!loggedFirst) {
+      loggedFirst = true;
+      const first = data
+        .subarray(0, 160)
+        .toString("latin1")
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n");
+      console.log(`[raw] primeiros bytes do VPS: ${first}`);
+    }
+    const out = debug ? data : strip(data);
+    if (out && out.length && client.writable) {
+      toClient += out.length;
+      client.write(out);
+    }
   });
 
   client.on("data", (data) => {
+    fromClient += data.length;
     if (!upstream || upstream.destroyed) return;
     if (ready) upstream.write(data);
     else queue.push(data);
   });
 
+  const stats = () =>
+    console.log(
+      `[raw] fim: do cliente ${fromClient}B, do VPS ${fromVps}B, enviado ao cliente ${toClient}B`
+    );
+
   upstream.on("timeout", () => {
+    stats();
     console.error("[raw] timeout na conexao com o VPS");
     closeBoth();
   });
@@ -98,7 +123,10 @@ function startRawTunnel(client, head, port, request) {
     console.error(`[raw] erro upstream: ${err.code || ""} ${err.message}`);
     closeBoth();
   });
-  upstream.on("close", closeBoth);
+  upstream.on("close", () => {
+    stats();
+    closeBoth();
+  });
   client.on("close", closeBoth);
   client.on("error", closeBoth);
 }
@@ -148,6 +176,7 @@ server.on("upgrade", (req, clientSocket, head) => {
   }
 
   const raw = incoming.searchParams.get("raw") === "1";
+  const debug = incoming.searchParams.get("debug") === "1";
 
   let key = req.headers["sec-websocket-key"];
   if (!key) {
@@ -195,7 +224,7 @@ server.on("upgrade", (req, clientSocket, head) => {
         "Connection: Upgrade\r\n" +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
-    startRawTunnel(clientSocket, head, port, request);
+    startRawTunnel(clientSocket, head, port, request, debug);
     return;
   }
 
