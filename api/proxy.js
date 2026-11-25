@@ -1,14 +1,13 @@
+
 import http from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 
 const VPS_HOST = "cdn.dpnet.online";
 
-const DESTINOS = {
+const TARGETS = {
   "80": `ws://${VPS_HOST}:80`,
   "443": `wss://${VPS_HOST}:443`
 };
-
-const HANDSHAKE_TIMEOUT = 15000;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
@@ -17,13 +16,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
       "Content-Type": "application/json"
     });
-
     res.end(JSON.stringify({
       service: "DROPNET CDN",
       status: "online",
       ports: [80, 443]
     }));
-
     return;
   }
 
@@ -31,8 +28,7 @@ const server = http.createServer((req, res) => {
     "Content-Type": "text/plain",
     "Upgrade": "websocket"
   });
-
-  res.end("DROPNET CDN - WebSocket necessário.");
+  res.end("WebSocket necessário.");
 });
 
 const wss = new WebSocketServer({
@@ -41,97 +37,53 @@ const wss = new WebSocketServer({
   maxPayload: 64 * 1024 * 1024
 });
 
-function responderErro(socket, status, mensagem) {
+function errorResponse(socket, status, message) {
   if (socket.destroyed) return;
-
-  const body = mensagem;
 
   socket.end(
     `HTTP/1.1 ${status}\r\n` +
     "Connection: close\r\n" +
     "Content-Type: text/plain; charset=utf-8\r\n" +
-    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n` +
-    body
+    `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n` +
+    message
   );
-}
-
-function encaminhar(cliente, upstream) {
-  cliente.on("message", (data, binary) => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.send(data, { binary });
-    }
-  });
-
-  upstream.on("message", (data, binary) => {
-    if (cliente.readyState === WebSocket.OPEN) {
-      cliente.send(data, { binary });
-    }
-  });
-
-  cliente.on("close", () => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.close();
-    } else {
-      upstream.terminate();
-    }
-  });
-
-  upstream.on("close", () => {
-    if (cliente.readyState === WebSocket.OPEN) {
-      cliente.close();
-    }
-  });
-
-  cliente.on("error", () => upstream.terminate());
-  upstream.on("error", () => cliente.terminate());
 }
 
 server.on("upgrade", (req, socket, head) => {
-  const incoming = new URL(
-    req.url || "/",
-    "http://localhost"
-  );
+  const incoming = new URL(req.url || "/", "http://localhost");
 
   if (incoming.pathname !== "/api/proxy") {
-    responderErro(socket, "404 Not Found", "Rota inexistente.");
+    errorResponse(socket, "404 Not Found", "Rota inexistente.");
     return;
   }
 
   const port = incoming.searchParams.get("port") || "443";
-  const base = DESTINOS[port];
+  const base = TARGETS[port];
 
   if (!base) {
-    responderErro(socket, "400 Bad Request", "Porta inválida. Use 80 ou 443.");
+    errorResponse(socket, "400 Bad Request", "Porta inválida.");
     return;
   }
 
   const path = incoming.searchParams.get("path") || "/";
 
   if (!path.startsWith("/") || path.startsWith("//")) {
-    responderErro(socket, "400 Bad Request", "Caminho inválido.");
+    errorResponse(socket, "400 Bad Request", "Caminho inválido.");
     return;
   }
 
-  let target;
+  const target = new URL(path, base);
+  const expected = new URL(base);
 
-  try {
-    target = new URL(path, base);
-
-    const expected = new URL(base);
-
-    if (target.host !== expected.host) {
-      responderErro(socket, "400 Bad Request", "Destino inválido.");
-      return;
-    }
-
-    for (const [key, value] of incoming.searchParams) {
-      if (key !== "port" && key !== "path") {
-        target.searchParams.append(key, value);
-      }
-    }
-  } catch {
-    responderErro(socket, "400 Bad Request", "URL inválida.");
+  if (target.host !== expected.host) {
+    errorResponse(socket, "400 Bad Request", "Destino inválido.");
     return;
+  }
+
+  for (const [key, value] of incoming.searchParams) {
+    if (key !== "port" && key !== "path") {
+      target.searchParams.append(key, value);
+    }
   }
 
   const headers = {};
@@ -152,20 +104,18 @@ server.on("upgrade", (req, socket, head) => {
 
   const upstream = new WebSocket(target.toString(), {
     headers,
-    handshakeTimeout: HANDSHAKE_TIMEOUT,
+    handshakeTimeout: 15000,
     perMessageDeflate: false,
     rejectUnauthorized: true
   });
 
   let finished = false;
 
-  function falhar(mensagem) {
+  function fail(message) {
     if (finished) return;
     finished = true;
-
     upstream.terminate();
-
-    responderErro(socket, "502 Bad Gateway", mensagem);
+    errorResponse(socket, "502 Bad Gateway", message);
   }
 
   socket.on("close", () => {
@@ -176,16 +126,12 @@ server.on("upgrade", (req, socket, head) => {
 
   upstream.on("unexpected-response", (request, response) => {
     const status = response.statusCode || "desconhecido";
-
-    falhar(
-      `A VPS rejeitou o handshake. HTTP ${status}. Verifique o caminho e o serviço WebSocket.`
-    );
-
     response.resume();
+    fail(`Handshake da origem rejeitado: HTTP ${status}.`);
   });
 
-  upstream.on("error", (error) => {
-    falhar(`Falha na conexão com a VPS: ${error.message}`);
+  upstream.on("error", error => {
+    fail(`Falha na origem: ${error.message}`);
   });
 
   upstream.on("open", () => {
@@ -194,14 +140,26 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
 
-    try {
-      wss.handleUpgrade(req, socket, head, (cliente) => {
-        finished = true;
-        encaminhar(cliente, upstream);
+    wss.handleUpgrade(req, socket, head, client => {
+      finished = true;
+
+      client.on("message", (data, binary) => {
+        if (upstream.readyState === WebSocket.OPEN) {
+          upstream.send(data, { binary });
+        }
       });
-    } catch (error) {
-      falhar("Falha ao aceitar conexão do cliente.");
-    }
+
+      upstream.on("message", (data, binary) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(data, { binary });
+        }
+      });
+
+      client.on("close", () => upstream.terminate());
+      upstream.on("close", () => client.close());
+      client.on("error", () => upstream.terminate());
+      upstream.on("error", () => client.terminate());
+    });
   });
 });
 
